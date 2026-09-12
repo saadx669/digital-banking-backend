@@ -60,12 +60,41 @@ class TransferRequest(BaseModel):
     amount: float
     initiated_by: str
 
+    # Fraud signals - evaluated synchronously inside transfer_money
+    # before any funds move. Default to False if the caller (e.g. an
+    # n8n workflow doing frequency/location checks) doesn't supply them.
+    new_recipient: bool = False
+    unusual_frequency: bool = False
+    unusual_location: bool = False
+    unusual_time: bool = False
+    suspicious_pattern: bool = False
+
 
 class WithdrawalRequest(BaseModel):
     idempotency_key: str
     account_number: str
     amount: float
     initiated_by: str
+
+    new_recipient: bool = False
+    unusual_frequency: bool = False
+    unusual_location: bool = False
+    unusual_time: bool = False
+    suspicious_pattern: bool = False
+
+
+class ConsentRequest(BaseModel):
+    customer_id: str
+    decision: str  # "APPROVED" or "REJECTED"
+    reason: str | None = None
+
+    # Same fraud signals, re-evaluated at the moment consensus is
+    # reached and funds are about to actually move.
+    new_recipient: bool = False
+    unusual_frequency: bool = False
+    unusual_location: bool = False
+    unusual_time: bool = False
+    suspicious_pattern: bool = False
 
 
 class FraudCheckRequest(BaseModel):
@@ -152,13 +181,29 @@ def transfer(request: TransferRequest):
                 "p_from_account_number": request.from_account_number,
                 "p_to_account_number": request.to_account_number,
                 "p_amount": request.amount,
-                "p_initiated_by": request.initiated_by
+                "p_initiated_by": request.initiated_by,
+                "p_new_recipient": request.new_recipient,
+                "p_unusual_frequency": request.unusual_frequency,
+                "p_unusual_location": request.unusual_location,
+                "p_unusual_time": request.unusual_time,
+                "p_suspicious_pattern": request.suspicious_pattern
             }
         ).execute()
 
+        result = response.data
+
+        # A JOINT account under BOTH_SIGNATURES/MAJORITY authority comes
+        # back PENDING - no funds moved yet, co-signers still need to act.
+        if result and result[0].get("transaction_status") == "PENDING":
+            return {
+                "success": True,
+                "result": result,
+                "note": "Awaiting co-signer approval. Use POST /transactions/{id}/consent."
+            }
+
         return {
             "success": True,
-            "result": response.data
+            "result": result
         }
 
     except Exception as e:
@@ -184,7 +229,129 @@ def withdraw(request: WithdrawalRequest):
                 "p_idempotency_key": request.idempotency_key,
                 "p_account_number": request.account_number,
                 "p_amount": request.amount,
-                "p_initiated_by": request.initiated_by
+                "p_initiated_by": request.initiated_by,
+                "p_new_recipient": request.new_recipient,
+                "p_unusual_frequency": request.unusual_frequency,
+                "p_unusual_location": request.unusual_location,
+                "p_unusual_time": request.unusual_time,
+                "p_suspicious_pattern": request.suspicious_pattern
+            }
+        ).execute()
+
+        result = response.data
+
+        if result and result[0].get("transaction_status") == "PENDING":
+            return {
+                "success": True,
+                "result": result,
+                "note": "Awaiting co-signer approval. Use POST /transactions/{id}/consent."
+            }
+
+        return {
+            "success": True,
+            "result": result
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Withdrawal error: {str(e)}"
+        )
+
+
+# ============================================================
+# GET TRANSACTION
+# ============================================================
+
+@app.get("/transactions/{transaction_id}")
+def get_transaction(transaction_id: str):
+
+    try:
+
+        response = (
+            supabase
+            .table("transactions")
+            .select("*")
+            .eq("id", transaction_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not response.data:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Transaction not found"
+            )
+
+        return {
+            "success": True,
+            "transaction": response.data[0]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Transaction fetch error: {str(e)}"
+        )
+
+
+# ============================================================
+# GET TRANSACTION CONSENTS (who has approved/rejected so far)
+# ============================================================
+
+@app.get("/transactions/{transaction_id}/consents")
+def get_transaction_consents(transaction_id: str):
+
+    try:
+
+        response = (
+            supabase
+            .table("transaction_consents")
+            .select("*")
+            .eq("transaction_id", transaction_id)
+            .execute()
+        )
+
+        return {
+            "success": True,
+            "consents": response.data
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Consent fetch error: {str(e)}"
+        )
+
+
+# ============================================================
+# RECORD A CO-SIGNER'S CONSENT ON A JOINT TRANSACTION
+# ============================================================
+
+@app.post("/transactions/{transaction_id}/consent")
+def record_transaction_consent(transaction_id: str, request: ConsentRequest):
+
+    try:
+
+        response = supabase.rpc(
+            "record_transaction_consent",
+            {
+                "p_transaction_id": transaction_id,
+                "p_customer_id": request.customer_id,
+                "p_decision": request.decision,
+                "p_reason": request.reason,
+                "p_new_recipient": request.new_recipient,
+                "p_unusual_frequency": request.unusual_frequency,
+                "p_unusual_location": request.unusual_location,
+                "p_unusual_time": request.unusual_time,
+                "p_suspicious_pattern": request.suspicious_pattern
             }
         ).execute()
 
@@ -197,7 +364,7 @@ def withdraw(request: WithdrawalRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=f"Withdrawal error: {str(e)}"
+            detail=f"Consent error: {str(e)}"
         )
 
 
